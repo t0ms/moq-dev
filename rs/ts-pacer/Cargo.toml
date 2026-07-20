@@ -1,0 +1,28 @@
+[package]
+name = "ts-pacer"
+description = "Transport-agnostic MPEG-TS constant-bitrate pacer for broadcast (IRD) egress."
+authors = ["Thomas Drapier"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["mpeg-ts", "broadcast", "cbr", "pcr", "pacing"]
+categories = ["multimedia", "network-programming"]
+
+[lib]
+doctest = false
+
+# Deliberately free of any moq-* / QUIC dependency: the crate is a pure MPEG-TS
+# shaper and is meant to be extractable into its own repository unchanged. Keep
+# the dependency set to the standard async + bytes toolbox.
+[dependencies]
+bytes = "1"
+thiserror = "2"
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros", "io-util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

@@ -25,6 +25,7 @@ members = [
     "rs/moq-token-cli",
     "rs/moq-video",
     "rs/moq-wasm",
+    "rs/ts-pacer",
 ]
 default-members = [
     "rs/kio",
@@ -52,6 +53,7 @@ default-members = [
     "rs/moq-token-cli",
     "rs/moq-video",
     # "rs/moq-wasm",  # wasm32-unknown-unknown target only
+    "rs/ts-pacer",
 ]
 resolver = "2"
 

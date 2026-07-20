@@ -9,9 +9,15 @@
 # Receiver/Decoder would accept, and to quantify where it diverges (the exporter
 # is VBR, emits no null packets, and paces PCR per frame).
 #
+# `--via-srt` swaps the stdin ingest for the real SRT contribution path: ffmpeg
+# pushes the source over SRT into `moq import srt --listen` instead of piping it
+# to `moq import ts`. The egress and the compliance analysis are identical, so
+# the same report also covers the SRT ingest gateway (moq-srt's TS reassembly).
+#
 # Modes:
 #   ./run.sh                       # generate a clip, round-trip it, analyze
 #   ./run.sh --source cap.ts       # round-trip a real capture instead
+#   ./run.sh --via-srt             # ingest over SRT (ffmpeg -> moq import srt)
 #   ./run.sh --analyze-only cap.ts # skip the round-trip, just analyze a file
 #   ./run.sh --strict              # fail on broadcast-shape warnings too
 set -euo pipefail
@@ -21,12 +27,18 @@ WORKSPACE=$(cd "$DIR/../.." && pwd)
 
 SOURCE=""       # real capture to publish instead of a generated clip
 ANALYZE_ONLY="" # existing TS to analyze without a round-trip
+VIA_SRT=""      # ingest over SRT (ffmpeg -> moq import srt) instead of stdin
 DURATION="${TSC_DURATION:-20}"
 BITRATE="${TSC_BITRATE:-10000000}"
 PORT="${TSC_PORT:-4443}"
+SRT_PORT="${TSC_SRT_PORT:-9000}"
 PROFILE="${TSC_PROFILE:-debug}"
 STRICT=""
 PASSTHRU=() # forwarded to compliance.py (thresholds, --report-json, ...)
+
+# Homebrew's plain `ffmpeg` formula lacks libsrt; `ffmpeg-full` (or a from-source
+# build) has it. Override via FFMPEG_BIN if your SRT-capable ffmpeg lives elsewhere.
+FFMPEG="${FFMPEG_BIN:-ffmpeg}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -37,6 +49,10 @@ while [[ $# -gt 0 ]]; do
         --analyze-only)
             ANALYZE_ONLY="$2"
             shift 2
+            ;;
+        --via-srt)
+            VIA_SRT="1"
+            shift
             ;;
         --duration)
             DURATION="$2"
@@ -50,6 +66,10 @@ while [[ $# -gt 0 ]]; do
             PORT="$2"
             shift 2
             ;;
+        --srt-port)
+            SRT_PORT="$2"
+            shift 2
+            ;;
         --strict)
             STRICT="--strict"
             shift
@@ -60,6 +80,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$ANALYZE_ONLY" && -n "$VIA_SRT" ]]; then
+    echo "error: --via-srt has no effect with --analyze-only (no round-trip)" >&2
+    exit 2
+fi
 
 URL="http://127.0.0.1:${PORT}"
 
@@ -73,11 +98,19 @@ require_tools() {
     # ffmpeg + cargo are only needed for the round-trip, not for --analyze-only.
     # pgrep backs kill_tree; without it grandchild tsp/moq processes would leak.
     if [[ -z "$ANALYZE_ONLY" ]]; then
-        for t in cargo ffmpeg curl timeout pgrep; do have "$t" || missing+=("$t"); done
+        for t in cargo curl timeout pgrep; do have "$t" || missing+=("$t"); done
+        have "$FFMPEG" || missing+=("$FFMPEG")
     fi
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "error: missing required tools: ${missing[*]}" >&2
         echo "  TSDuck (tsp, tsanalyze) is required; install from https://tsduck.io" >&2
+        exit 1
+    fi
+    # SRT ingest needs an SRT-capable ffmpeg; plain Homebrew ffmpeg has none.
+    if [[ -n "$VIA_SRT" ]] && ! "$FFMPEG" -hide_banner -protocols 2>&1 | grep -qx '  srt'; then
+        echo "error: $FFMPEG has no SRT protocol support (needed for --via-srt)." >&2
+        echo "       install an SRT-capable build (e.g. 'brew install ffmpeg-full') and set" >&2
+        echo "       FFMPEG_BIN=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg" >&2
         exit 1
     fi
 }
@@ -125,6 +158,7 @@ SUB_TS="$TMP/sub.ts"
 RELAY_PID=""
 PUB_PID=""
 SUB_PID=""
+SRT_PID="" # `moq import srt --listen` gateway, only with --via-srt
 
 kill_tree() {
     local pid="$1" child
@@ -136,6 +170,7 @@ kill_tree() {
 cleanup() {
     [[ -n "$SUB_PID" ]] && kill_tree "$SUB_PID"
     [[ -n "$PUB_PID" ]] && kill_tree "$PUB_PID"
+    [[ -n "$SRT_PID" ]] && kill_tree "$SRT_PID"
     [[ -n "$RELAY_PID" ]] && kill_tree "$RELAY_PID"
     rm -rf "$TMP"
 }
@@ -156,7 +191,7 @@ if [[ -n "$SOURCE" ]]; then
     }
 else
     echo "### generating ~${DURATION}s broadcast-like clip with ffmpeg"
-    ffmpeg -y -hide_banner -loglevel error \
+    "$FFMPEG" -y -hide_banner -loglevel error \
         -f lavfi -i "testsrc=size=1280x720:rate=25" \
         -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
         -t "$DURATION" \
@@ -189,18 +224,45 @@ timeout -k 3 $((DURATION + 20)) \
 SUB_PID=$!
 sleep 1
 
-# Pace on the source PCR (real media time), not a fixed bitrate: a synthetic clip
-# compresses tiny, so bitrate pacing would rush the whole stream out in a blink.
-# Bounded like the subscriber: if the relay stalls after readiness, `moq import
-# ts` could otherwise block `wait "$PUB_PID"` forever. tsp/moq stderr lands in
-# pub.log, which the empty-capture handler below dumps on failure.
-echo "### publishing PCR-paced TS -> $BROADCAST"
-# shellcheck disable=SC2016  # $1..$4 are the child bash -c positionals, not ours.
-timeout -k 3 $((DURATION + 20)) bash -c '
-    tsp -I file "$1" -P regulate --pcr-synchronous |
-        "$2" --client-connect "$3" --broadcast "$4" import ts
-' _ "$SRC_TS" "$MOQ" "$URL" "$BROADCAST" >"$TMP/pub.log" 2>&1 &
-PUB_PID=$!
+if [[ -n "$VIA_SRT" ]]; then
+    # SRT ingest path: ffmpeg pushes the source over SRT into `moq import srt
+    # --listen`, exercising moq-srt's TS reassembly instead of the stdin reader.
+    # The listener routes to --broadcast (the SRT stream id is accepted but not
+    # used), so any publish-mode stream id works.
+    echo "### starting SRT ingest gateway (moq import srt --listen 127.0.0.1:${SRT_PORT})"
+    "$MOQ" --client-connect "$URL" --broadcast "$BROADCAST" import srt --listen "127.0.0.1:${SRT_PORT}" \
+        >"$TMP/srt.log" 2>&1 &
+    SRT_PID=$!
+    for _ in $(seq 1 60); do
+        grep -q "SRT listening" "$TMP/srt.log" 2>/dev/null && break
+        sleep 0.5
+    done
+    if ! grep -q "SRT listening" "$TMP/srt.log" 2>/dev/null; then
+        echo "error: SRT gateway never became ready" >&2
+        sed 's/^/  srt: /' "$TMP/srt.log" >&2 || true
+        exit 1
+    fi
+
+    # ffmpeg -re paces on the source's own timestamps (real media time), matching
+    # a live contribution feed. Bounded so a stalled relay can't wedge the wait.
+    echo "### publishing $SRC_TS over SRT with ffmpeg -> $BROADCAST"
+    timeout -k 3 $((DURATION + 20)) "$FFMPEG" -hide_banner -loglevel error -re -i "$SRC_TS" -c copy -f mpegts \
+        "srt://127.0.0.1:${SRT_PORT}?streamid=#!::r=${BROADCAST},m=publish" >"$TMP/pub.log" 2>&1 &
+    PUB_PID=$!
+else
+    # Pace on the source PCR (real media time), not a fixed bitrate: a synthetic
+    # clip compresses tiny, so bitrate pacing would rush the whole stream out in a
+    # blink. Bounded like the subscriber: if the relay stalls after readiness, `moq
+    # import ts` could otherwise block `wait "$PUB_PID"` forever. tsp/moq stderr
+    # lands in pub.log, which the empty-capture handler below dumps on failure.
+    echo "### publishing PCR-paced TS -> $BROADCAST"
+    # shellcheck disable=SC2016  # $1..$4 are the child bash -c positionals, not ours.
+    timeout -k 3 $((DURATION + 20)) bash -c '
+        tsp -I file "$1" -P regulate --pcr-synchronous |
+            "$2" --client-connect "$3" --broadcast "$4" import ts
+    ' _ "$SRC_TS" "$MOQ" "$URL" "$BROADCAST" >"$TMP/pub.log" 2>&1 &
+    PUB_PID=$!
+fi
 
 # Keep the publisher's exit status: `timeout` returns 124 when it had to kill a
 # stalled `moq import ts`, non-zero/non-124 means the import itself errored. Both
@@ -210,11 +272,14 @@ PUB_PID=""
 sleep 3
 kill_tree "$SUB_PID" 2>/dev/null || true
 SUB_PID=""
+[[ -n "$SRT_PID" ]] && kill_tree "$SRT_PID" 2>/dev/null || true
+SRT_PID=""
 
 # shellcheck disable=SC2329  # invoked from multiple failure paths below
 dump_logs() {
     echo "  publisher exit status: $PUB_RC" >&2
     sed 's/^/  pub: /' "$TMP/pub.log" >&2 || true
+    [[ -f "$TMP/srt.log" ]] && sed 's/^/  srt: /' "$TMP/srt.log" >&2 || true
     sed 's/^/  sub: /' "$TMP/sub.log" >&2 || true
 }
 

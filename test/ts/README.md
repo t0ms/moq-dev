@@ -16,9 +16,17 @@ and by how much.
 ```bash
 just test ts                    # generate a clip, round-trip, analyze
 just test ts --source cap.ts    # round-trip a real capture instead
+just test ts --via-srt          # ingest over SRT (ffmpeg -> moq import srt)
 just test ts --analyze-only x.ts # skip the round-trip, analyze a file
 just test ts --strict           # also fail on broadcast-shape warnings
 ```
+
+`--via-srt` swaps the stdin ingest (`tsp | moq import ts`) for the real SRT
+contribution path: ffmpeg pushes the source over SRT into `moq import srt
+--listen`, so the same report also covers moq-srt's TS reassembly. The egress and
+analysis are unchanged. It needs an SRT-capable ffmpeg (plain Homebrew `ffmpeg`
+has none; install `ffmpeg-full` or set `FFMPEG_BIN`). Combine with `--source`
+to push a real capture, e.g. `just test ts --via-srt --source cap.ts`.
 
 `--analyze-only` needs only TSDuck + Python, so you can point it at any captured
 subscriber output:
@@ -29,7 +37,8 @@ moq --client-connect http://localhost:4443 --broadcast live.hang export ts > sub
 ```
 
 Requirements: `tsp` and `tsanalyze` (TSDuck) and `python3` for every mode; the
-round-trip modes also need `cargo`, `ffmpeg`, `curl`, and `timeout`.
+round-trip modes also need `cargo`, `ffmpeg`, `curl`, and `timeout`. `--via-srt`
+additionally needs that ffmpeg to have SRT protocol support.
 
 ## Checks
 

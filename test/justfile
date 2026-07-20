@@ -44,8 +44,18 @@ smoke-negative *args:
 # ts` output with TSDuck plus a custom analyzer (PCR jitter/repetition,
 # burstiness, instantaneous bitrate, T-STD). Flags: `--analyze-only file.ts`
 # (skip the round-trip), `--strict` (fail on shape warnings), `--source file.ts`
-# (use a real capture). See ts/README.md.
+# (use a real capture), `--via-srt` (ingest over SRT: ffmpeg -> moq import srt).
+# See ts/README.md.
 
 # Check the subscriber's MPEG-TS output for IRD compliance.
 ts *args:
     ./ts/run.sh {{ args }}
+
+# Shapes a TS through the `ts-pacer` crate's offline CBR groomer and checks that
+# the paced output is IRD-compliant: a TSDuck `pcrverify` PCR-accuracy gate plus
+# the `ts/` analyzer (PCR jitter/repetition, duration fidelity, T-STD). Unlike
+# `ts` this doesn't need a relay; it validates the downstream pacing stage in
+# isolation. Flags: `--source file.ts`, `--bitrate N`, `--pcr preserve`,
+# `--strict`. See ts-pacer/README.md.
+ts-pacer *args:
+    ./ts-pacer/run.sh {{ args }}

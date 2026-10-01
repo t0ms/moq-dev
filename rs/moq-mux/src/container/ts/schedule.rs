@@ -22,6 +22,8 @@ const PACKET: u64 = TsPacket::SIZE as u64 * 8 * SLOTS_PER_SECOND;
 /// this the media had an outage rather than a coarse cadence, and a dense clock history for
 /// a span that carried no bytes only stalls anything pacing on the asserted values.
 const BACKFILL: u128 = 40;
+/// A TS packet's payload, the most of it a decoder buffer can receive.
+const PAYLOAD: usize = 184;
 
 /// The grid slot a unit whose last byte has to arrive by `nanos` must be sent by: the
 /// slot's bytes are timed up to its boundary.
@@ -39,11 +41,66 @@ struct Unit {
 	/// Packets already laid out.
 	sent: usize,
 	keyframe: bool,
+	/// The PID of the unit's last packet: its elementary stream.
+	pid: u16,
+	/// Experimental: the access units it carries, decoded evenly over `span` slots from `due`.
+	frames: usize,
+	span: u128,
+	/// Pairs the unit with its [`Decoding`] entry.
+	seq: u64,
+	/// It was pushed after its due slot had been laid out, so no schedule could meet it.
+	late: bool,
 }
 
 impl Unit {
 	fn remaining(&self) -> usize {
 		self.packets.len() / TsPacket::SIZE - self.sent
+	}
+
+	/// The slot its next packet is due by.
+	fn next_due(&self) -> u128 {
+		let count = self.packets.len() / TsPacket::SIZE;
+		frame_due(self.due, self.span, self.frames, self.sent * self.frames / count.max(1))
+	}
+
+	/// The packets that must have arrived by the end of slot `index`.
+	fn required(&self, index: u128) -> usize {
+		let count = self.packets.len() / TsPacket::SIZE;
+		let decoded = (0..self.frames)
+			.take_while(|&k| frame_due(self.due, self.span, self.frames, k) <= index)
+			.count();
+		(decoded * count).div_ceil(self.frames)
+	}
+}
+
+/// The slot frame `k` of a unit's `frames` decodes after: the last its bytes may ride.
+fn frame_due(due: u128, span: u128, frames: usize, k: usize) -> u128 {
+	due + span * k as u128 / frames as u128
+}
+
+/// The packets of a `count`-packet unit that carry frame `k` of its `frames`.
+fn frame_packets(count: usize, frames: usize, k: usize) -> usize {
+	((k + 1) * count).div_ceil(frames) - (k * count).div_ceil(frames)
+}
+
+/// A buffered unit not yet wholly decoded.
+struct Decoding {
+	seq: u64,
+	due: u128,
+	pid: u16,
+	count: usize,
+	frames: usize,
+	span: u128,
+	/// Frames already decoded.
+	removed: usize,
+	/// Packets sent so far.
+	sent: usize,
+}
+
+impl Decoding {
+	/// The packets of frames already decoded: they leave the buffer as soon as they arrive.
+	fn decoded(&self) -> usize {
+		(self.removed * self.count).div_ceil(self.frames)
 	}
 }
 
@@ -150,6 +207,46 @@ pub(super) struct Schedule {
 	last: Option<u128>,
 	/// Slots before this one may overrun the rate ([`Self::set_rate`]).
 	grace: Option<u128>,
+	/// Experimental: a decoder-buffer size in bytes per PID. Units on these PIDs are also sent
+	/// earliest deadline first, ahead of the as-late-as-possible floor, while the buffer has room.
+	buffers: HashMap<u16, usize>,
+	/// Bytes sent and not yet decoded, per buffered PID.
+	occupancy: HashMap<u16, usize>,
+	/// Buffered units by due slot, with their size, for removal at decode time.
+	decoding: VecDeque<Decoding>,
+	/// Experimental: a transport-buffer drain rate in bits per second per PID.
+	drains: HashMap<u16, u64>,
+	/// Experimental: the access units per unit on a PID whose units carry several.
+	frames: HashMap<u16, usize>,
+	/// The last span measured per PID, assumed for a unit whose successor is still to come.
+	spans: HashMap<u16, u128>,
+	seq: u64,
+	/// Experimental: the first slot laid out. The authored DTS of an open GOP's leading pictures
+	/// can bunch them past what any schedule carries, so lateness before two windows on is not fatal.
+	began: Option<u128>,
+	/// Experimental (`MOQ_TS_LATE=send`): a missed deadline is counted and the unit sent late,
+	/// rather than failing the export.
+	send_late: bool,
+	missed: u64,
+}
+
+/// The transport-buffer drain rate of a PID with none given (ISO 13818-1 Rxsys).
+const DEFAULT_RX: u64 = 1_000_000;
+
+/// `MOQ_TS_EB=pid=bytes[,...]` decoder-buffer sizes, `MOQ_TS_RX=pid=bps[,...]` drain rates,
+/// `MOQ_TS_FRAMES=pid=count[,...]` access units per unit.
+fn from_env<T: std::str::FromStr>(name: &str) -> HashMap<u16, T> {
+	std::env::var(name)
+		.ok()
+		.map(|spec| {
+			spec.split(',')
+				.filter_map(|entry| {
+					let (pid, bytes) = entry.split_once('=')?;
+					Some((pid.trim().parse().ok()?, bytes.trim().parse().ok()?))
+				})
+				.collect()
+		})
+		.unwrap_or_default()
 }
 
 impl Schedule {
@@ -162,6 +259,16 @@ impl Schedule {
 			next: None,
 			last: None,
 			grace: None,
+			buffers: from_env("MOQ_TS_EB"),
+			drains: from_env("MOQ_TS_RX"),
+			frames: from_env("MOQ_TS_FRAMES"),
+			spans: HashMap::new(),
+			seq: 0,
+			began: None,
+			send_late: std::env::var("MOQ_TS_LATE").is_ok_and(|v| v == "send"),
+			missed: 0,
+			occupancy: HashMap::new(),
+			decoding: VecDeque::new(),
 		}
 	}
 
@@ -187,7 +294,8 @@ impl Schedule {
 	/// delay) is due with it.
 	pub fn push(&mut self, by: u128, packets: Vec<u8>, keyframe: bool) {
 		let due = slot(by);
-		for unit in self.units.iter_mut().rev() {
+		// Scheduled per PID, units keep only their own PID's order, so none is pulled earlier.
+		for unit in self.units.iter_mut().rev().take_while(|_| self.buffers.is_empty()) {
 			if unit.due <= due {
 				break;
 			}
@@ -196,12 +304,49 @@ impl Schedule {
 		}
 		let start = self.last.map_or(due, |last| (last + 1).min(due));
 		self.last = Some(due);
+		let pid = packets.len().checked_sub(TsPacket::SIZE).map_or(0, |at| {
+			(u16::from(packets[at + 1] & 0x1f) << 8) | u16::from(packets[at + 2])
+		});
+		let frames = self.frames.get(&pid).copied().unwrap_or(1).max(1);
+		let span = match frames > 1 {
+			true => {
+				if let Some(unit) = self.units.iter_mut().rev().find(|unit| unit.pid == pid) {
+					unit.span = due.saturating_sub(unit.due);
+				}
+				if let Some(entry) = self.decoding.iter_mut().rev().find(|entry| entry.pid == pid) {
+					entry.span = due.saturating_sub(entry.due);
+					self.spans.insert(pid, entry.span);
+				}
+				self.spans.get(&pid).copied().unwrap_or(0)
+			}
+			false => 0,
+		};
+		self.seq += 1;
+		let late = self.next.is_some_and(|next| due < next);
+		tracing::debug!(pid, due, next = self.next.unwrap_or(0), late, "ts unit pushed");
+		if self.buffers.contains_key(&pid) {
+			self.decoding.push_back(Decoding {
+				seq: self.seq,
+				due,
+				pid,
+				count: packets.len() / TsPacket::SIZE,
+				frames,
+				span,
+				removed: 0,
+				sent: 0,
+			});
+		}
 		self.units.push_back(Unit {
 			due,
 			start,
 			packets,
 			sent: 0,
 			keyframe,
+			pid,
+			frames,
+			span,
+			seq: self.seq,
+			late,
 		});
 	}
 
@@ -216,6 +361,9 @@ impl Schedule {
 		self.last = None;
 		self.grace = None;
 		self.credit = 0;
+		self.occupancy.clear();
+		self.decoding.clear();
+		self.began = None;
 	}
 
 	/// Lay out the next slot, if it is settled.
@@ -253,24 +401,55 @@ impl Schedule {
 				self.credit += rate;
 				let allowed = (self.credit / PACKET).max(1);
 				self.credit -= (self.credit / PACKET).min(allowed) * PACKET;
-				let media = self.needed(index, rate / PACKET);
-				let overrun = media >= allowed as usize;
-				anyhow::ensure!(
-					!overrun || self.grace.is_some_and(|grace| index < grace),
-					"MPEG-TS output needs {media} packets in a {}ms slot, more than {rate} b/s allows within the delay; raise the delay or the multiplex rate",
-					PCR_INTERVAL.as_millis()
-				);
-				let mut left = media;
-				let take: Vec<usize> = self
-					.units
-					.iter()
-					.map(|unit| {
-						let take = unit.remaining().min(left);
-						left -= take;
-						take
-					})
-					.collect();
-				(take, (allowed as usize - 1).saturating_sub(media))
+				if !self.buffers.is_empty() {
+					let began = *self.began.get_or_insert(index);
+					let take = self.admit(index, allowed as usize - 1);
+					let late = self
+						.units
+						.iter()
+						.zip(take.iter())
+						.position(|(unit, take)| !unit.late && unit.sent + *take < unit.required(index));
+					let excused = self.grace.is_some_and(|grace| index < grace) || index < began + 2 * self.window;
+					if let Some(i) = late.filter(|_| !excused) {
+						let unit = &mut self.units[i];
+						anyhow::ensure!(
+							self.send_late,
+							"MPEG-TS output missed a decode deadline on PID {} in a {}ms slot at {rate} b/s; raise the delay or the multiplex rate",
+							unit.pid,
+							PCR_INTERVAL.as_millis(),
+						);
+						unit.late = true;
+						self.missed += 1;
+						if self.missed.is_power_of_two() {
+							tracing::warn!(
+								pid = unit.pid,
+								missed = self.missed,
+								"MPEG-TS unit missed its decode deadline; sending it late"
+							);
+						}
+					}
+					let media = take.iter().sum::<usize>();
+					(take, (allowed as usize - 1).saturating_sub(media))
+				} else {
+					let media = self.needed(index, rate / PACKET);
+					let overrun = media >= allowed as usize;
+					anyhow::ensure!(
+						!overrun || self.grace.is_some_and(|grace| index < grace),
+						"MPEG-TS output needs {media} packets in a {}ms slot, more than {rate} b/s allows within the delay; raise the delay or the multiplex rate",
+						PCR_INTERVAL.as_millis()
+					);
+					let mut left = media;
+					let take: Vec<usize> = self
+						.units
+						.iter()
+						.map(|unit| {
+							let take = unit.remaining().min(left);
+							left -= take;
+							take
+						})
+						.collect();
+					(take, (allowed as usize - 1).saturating_sub(media))
+				}
 			}
 			None => {
 				let take = self
@@ -303,6 +482,79 @@ impl Schedule {
 			nulls,
 			keyframe,
 		}))
+	}
+
+	/// Experimental: each slot's packets chosen per PID, earliest deadline first, every unit
+	/// sent as soon as it is released and its PID's buffers admit it.
+	///
+	/// A PID takes no more packets in a slot than its transport buffer drains in one (the
+	/// layout spreads them evenly through the slot), and a buffered PID no more than its
+	/// decoder buffer has room for. A PID with no decoder buffer given goes only in its due
+	/// slot or the one before, since nothing bounds how early it may arrive.
+	fn admit(&mut self, index: u128, mut budget: usize) -> Vec<usize> {
+		// A unit due in slot k decodes during slot k + 1 (slots are timed up to their end
+		// boundary), so its bytes leave the buffer only once that slot is past. Units of
+		// different PIDs are not pushed in due order, so every entry is checked.
+		for entry in self.decoding.iter_mut() {
+			if entry.due + 1 >= index {
+				continue;
+			}
+			let held = self.occupancy.entry(entry.pid).or_default();
+			while entry.removed < entry.frames
+				&& frame_due(entry.due, entry.span, entry.frames, entry.removed) + 1 < index
+			{
+				let first = entry.decoded();
+				let packets = frame_packets(entry.count, entry.frames, entry.removed);
+				let arrived = entry.sent.saturating_sub(first).min(packets);
+				*held = held.saturating_sub(arrived * PAYLOAD);
+				entry.removed += 1;
+			}
+		}
+		self.decoding.retain(|entry| entry.removed < entry.frames);
+		let slot_ns = PCR_INTERVAL.as_nanos() as u64;
+		let mut drained: HashMap<u16, usize> = HashMap::new();
+		let mut blocked: Vec<u16> = Vec::new();
+		let mut take = vec![0; self.units.len()];
+		// Earliest deadline first; the sort is stable, so each PID keeps its order.
+		let mut order: Vec<usize> = (0..self.units.len()).collect();
+		order.sort_by_key(|&i| self.units[i].next_due());
+		for i in order {
+			let (unit, take) = (&self.units[i], &mut take[i]);
+			if budget == 0 {
+				break;
+			}
+			if blocked.contains(&unit.pid) {
+				continue;
+			}
+			let released = match self.buffers.contains_key(&unit.pid) {
+				true => unit.due.saturating_sub(self.window) <= index,
+				false => unit.due <= index + 1,
+			};
+			if !released {
+				blocked.push(unit.pid);
+				continue;
+			}
+			let rx = self.drains.get(&unit.pid).copied().unwrap_or(DEFAULT_RX);
+			let cap = ((rx * slot_ns / 1_000_000_000) / (TsPacket::SIZE as u64 * 8)).saturating_sub(1) as usize;
+			let sent = drained.entry(unit.pid).or_default();
+			let mut extra = unit.remaining().min(budget).min(cap.saturating_sub(*sent));
+			if let Some(&size) = self.buffers.get(&unit.pid) {
+				let held = self.occupancy.entry(unit.pid).or_default();
+				extra = extra.min(size.saturating_sub(*held) / PAYLOAD);
+				if let Some(entry) = self.decoding.iter_mut().find(|entry| entry.seq == unit.seq) {
+					let stays = (entry.sent + extra).saturating_sub(entry.sent.max(entry.decoded()));
+					*held += stays * PAYLOAD;
+					entry.sent += extra;
+				}
+			}
+			*take = extra;
+			*sent += extra;
+			budget -= extra;
+			if extra < unit.remaining() {
+				blocked.push(unit.pid);
+			}
+		}
+		take
 	}
 
 	/// The fewest packets slot `index` must carry so every queued unit still arrives by its

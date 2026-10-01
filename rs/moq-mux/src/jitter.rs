@@ -98,6 +98,17 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 			.map_or((0, 0), |track| (track.generation, track.discontinuity));
 		if discontinuity != arrival.discontinuity {
 			generation = self.rejoin(generation, &arrival);
+		} else if std::env::var_os("MOQ_JITTER_FOLLOW").is_some()
+			&& let Some((&latest, &anchor)) = self.anchors.last_key_value()
+			&& latest > generation
+			&& self
+				.deadline(anchor, arrival.decode)
+				.is_some_and(|deadline| arrival.arrived <= deadline)
+		{
+			// Another track opened a newer clock: follow it at the first frame not late on it, so the
+			// output is never fed from two clocks at once. A sparse track (sections) may decode far
+			// ahead of its arrival, so it is held to that clock rather than required to land on it.
+			generation = latest;
 		}
 		let anchor = *self.anchors.entry(generation).or_insert_with(|| {
 			let after = self.horizon.and_then(|horizon| horizon.checked_sub(self.delay));
@@ -119,6 +130,12 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 		let push = match deadline {
 			_ if track.waiting && !arrival.sync => Push::Waiting,
 			Some(deadline) if arrival.arrived <= deadline || self.delay.is_zero() => {
+				tracing::debug!(
+					decode_ms = arrival.decode.as_nanos() / 1_000_000,
+					slack_ms = (deadline - arrival.arrived).as_millis() as u64,
+					generation,
+					"jitter queued"
+				);
 				track.waiting = false;
 				track.queue.push_back((deadline, generation, arrival.item));
 				self.horizon = self.horizon.max(Some(deadline));
@@ -150,14 +167,23 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 		let Some((&latest, &anchor)) = self.anchors.last_key_value() else {
 			return generation + 1;
 		};
-		let lands = self.deadline(anchor, arrival.decode).is_some_and(|deadline| {
-			let bound = (arrival.arrived + self.delay).max(self.horizon.unwrap_or(arrival.arrived));
-			arrival.arrived <= deadline && deadline <= bound
-		});
-		match latest > generation && lands {
+		let lands = self.lands(anchor, arrival);
+		// A frame that lands on the latest clock continues it, whether another track opened that
+		// generation or this one did: a skipped group is a gap in the timeline, not a new one.
+		let rejoin = std::env::var_os("MOQ_JITTER_REJOIN").is_some();
+		match (latest > generation || rejoin) && lands {
 			true => latest,
 			false => latest.max(generation) + 1,
 		}
+	}
+
+	/// Whether a frame lands on `anchor`'s clock: neither late nor held past both an on-time frame
+	/// and everything already queued.
+	fn lands(&self, anchor: (Instant, Timestamp), arrival: &Arrival<T>) -> bool {
+		self.deadline(anchor, arrival.decode).is_some_and(|deadline| {
+			let bound = (arrival.arrived + self.delay).max(self.horizon.unwrap_or(arrival.arrived));
+			arrival.arrived <= deadline && deadline <= bound
+		})
 	}
 
 	/// When a frame decoding at `decode` goes out under `anchor`, if any instant holds it.

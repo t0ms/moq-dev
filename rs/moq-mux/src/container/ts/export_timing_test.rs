@@ -517,11 +517,51 @@ async fn a_skip_while_running_keeps_one_clock() {
 	assert_one_clock(|tick| (6 * GOP + 7..7 * GOP).contains(&tick)).await;
 }
 
+// The clock is anchored on the first frame read. A TS source sends its video up to a second ahead
+// of its decode time and its audio just in time, and a passed-through AC-3 PES of nine sync
+// frames arrives only once its 288 ms are complete, so audio of a given decode time can reach the
+// receiver more than a delay after the video. Anchored on the video, every such frame is late, and
+// a clock held to 30 ppm and 0.075 Hz/s takes hours to give the audio its slack back. On the wire
+// at a 500 ms delay that dropped one AC-3 PES a second, steadily, for the whole run.
+
+/// How much later than the other track one is sent: past [`DELAY`].
+const LONG_LAG: i64 = 700_000;
+
+/// A receiver joining at a group boundary, or mid-group, with one track sent [`LONG_LAG`] after
+/// the other, renders every frame that arrives once its tracks are all running.
+#[tokio::test(start_paused = true)]
+async fn a_track_sent_later_than_the_delay_loses_nothing() {
+	let mut lost = Vec::new();
+	for lag in [LONG_LAG, -LONG_LAG] {
+		for join in [3 * GOP, JOIN] {
+			let mut live = Live::new(1.0, lag);
+			live.run(join, &mut [], |_| false).await;
+			let mut leg = live.join(Duration::ZERO).await;
+			live.run(join + 20 * GOP, &mut [&mut leg], |_| false).await;
+			let dropped = leg.export.dropped();
+			if dropped > 0 {
+				lost.push(format!(
+					"{} sent {} ms late, joined {} frames into a group: {dropped} dropped",
+					if lag > 0 { "audio" } else { "video" },
+					lag.abs() / 1_000,
+					join % GOP,
+				));
+			}
+		}
+	}
+	assert!(
+		lost.is_empty(),
+		"frames went late on a clean source:\n{}",
+		lost.join("\n")
+	);
+}
+
 // A source's clock is never the receiver's. A transport stream's 27 MHz may be off by 30 ppm,
 // which walks a fixed anchor 108 ms an hour: a source running slow makes every frame late in
 // turn once the walk passes the delay, and one running fast makes the buffer grow without bound.
-// These cases run the source 400 ppm off, past what it may be off but inside the 500 ppm the
-// jitter buffer steers by, so that five minutes of media walk an unsteered clock 120 ms.
+// These cases run the source 25 ppm off, inside what the output's clock may follow. Five minutes
+// of media walk an unsteered clock only 7.5 ms, so they guard the steering against gross error;
+// following the source over hours is the jitter buffer's own tests' job.
 
 /// How far the instant each slot goes out may wander against the source over a run. A
 /// tracker may lag; what this rules out is the delay walking with the source clock.
@@ -550,14 +590,14 @@ async fn on_a_scaled_clock(scale: f64) -> (Duration, u64) {
 
 #[tokio::test(start_paused = true)]
 async fn a_slow_source_clock_keeps_the_delay() {
-	let (spread, dropped) = on_a_scaled_clock(0.9996).await;
+	let (spread, dropped) = on_a_scaled_clock(0.999975).await;
 	assert_eq!(dropped, 0, "frames went late as the source fell behind the anchor");
 	assert!(spread <= DRIFT_SLACK, "the delay walked by {spread:?}");
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_fast_source_clock_keeps_the_delay() {
-	let (spread, dropped) = on_a_scaled_clock(1.0004).await;
+	let (spread, dropped) = on_a_scaled_clock(1.000025).await;
 	assert_eq!(dropped, 0);
 	assert!(spread <= DRIFT_SLACK, "the delay walked by {spread:?}");
 }
@@ -637,7 +677,6 @@ async fn two_legs_pad_the_same_slots_at_a_fractional_rate() {
 
 /// A slow group reaches both legs. Both have to skip it the same way.
 #[tokio::test(start_paused = true)]
-#[ignore = "fails on 49efbc9a1: after the skip each leg anchors its new generation on its own reads"]
 async fn two_legs_render_a_skip_the_same_way() {
 	for lag in LAGS {
 		let (a, b, from) = pair(1.0, lag, 12 * GOP, |tick| (6 * GOP + 7..7 * GOP).contains(&tick)).await;
@@ -649,7 +688,7 @@ async fn two_legs_render_a_skip_the_same_way() {
 /// joined at different points on it.
 #[tokio::test(start_paused = true)]
 async fn two_legs_render_a_drifting_source_the_same_way() {
-	for scale in [0.9996, 1.0004] {
+	for scale in [0.999975, 1.000025] {
 		let (a, b, from) = pair(scale, 0, DRIFT_TICKS * 3 / 5, |_| false).await;
 		assert_same_packets(&a, &b, from);
 	}
@@ -662,7 +701,6 @@ async fn two_legs_render_a_drifting_source_the_same_way() {
 /// A receiver that joins a running broadcast mid-group keeps its output's system clock within
 /// 30 ppm of the source's and slews it no faster than 0.075 Hz/s, over 30 s windows of slots.
 #[tokio::test(start_paused = true)]
-#[ignore = "fails on 49efbc9a1: the clock steers at 500 ppm to wear away the join's lead"]
 async fn a_joiner_keeps_the_system_clock_in_tolerance() {
 	const WINDOW: u64 = 30_000_000;
 	let mut live = Live::new(1.0, 0);

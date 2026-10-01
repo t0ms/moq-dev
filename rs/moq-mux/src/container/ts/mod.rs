@@ -41,4 +41,6 @@ pub mod stats;
 #[cfg(test)]
 mod export_test;
 #[cfg(test)]
+mod export_timing_test;
+#[cfg(test)]
 mod import_test;

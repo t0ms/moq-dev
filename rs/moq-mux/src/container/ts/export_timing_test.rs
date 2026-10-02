@@ -518,6 +518,44 @@ async fn a_skip_while_running_keeps_one_clock() {
 	assert_one_clock(|tick| (6 * GOP + 7..7 * GOP).contains(&tick)).await;
 }
 
+// A TS source sends its video up to a second ahead of its decode time and its audio just in time,
+// and a passed-through AC-3 PES of nine sync frames arrives only once its 288 ms are complete, so
+// audio of a given decode time can reach the receiver more than a delay after the video. A clock
+// anchored, or steered, on the frame with the most slack gives the other track the delay less that
+// difference, and every one of its frames then goes late.
+
+/// How much later than the other track one is sent: past [`DELAY`].
+const LONG_LAG: i64 = 700_000;
+
+/// A receiver joining at a group boundary, or mid-group, with one track sent [`LONG_LAG`] after
+/// the other, renders every frame that arrives once its tracks are all running.
+#[tokio::test(start_paused = true)]
+async fn a_track_sent_later_than_the_delay_loses_nothing() {
+	let mut lost = Vec::new();
+	for lag in [LONG_LAG, -LONG_LAG] {
+		for join in [3 * GOP, JOIN] {
+			let mut live = Live::new(1.0, lag);
+			live.run(join, &mut [], |_| false).await;
+			let mut leg = live.join(Duration::ZERO).await;
+			live.run(join + 20 * GOP, &mut [&mut leg], |_| false).await;
+			let dropped = leg.export.dropped();
+			if dropped > 0 {
+				lost.push(format!(
+					"{} sent {} ms late, joined {} frames into a group: {dropped} dropped",
+					if lag > 0 { "audio" } else { "video" },
+					lag.abs() / 1_000,
+					join % GOP,
+				));
+			}
+		}
+	}
+	assert!(
+		lost.is_empty(),
+		"frames went late on a clean source:\n{}",
+		lost.join("\n")
+	);
+}
+
 // A source's clock is never the receiver's. A transport stream's 27 MHz may be off by 30 ppm,
 // which walks a fixed anchor 108 ms an hour: a source running slow makes every frame late in
 // turn once the walk passes the delay, and one running fast makes the buffer grow without bound.

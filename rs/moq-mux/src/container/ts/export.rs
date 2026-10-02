@@ -1261,6 +1261,7 @@ impl<E: catalog::Catalog> Export<E> {
 			track.kind = kind;
 			self.refresh(name, track, pids[name], entry.descriptors.clone());
 		}
+		self.jitter.expect(self.tracks.values().map(|track| track.pid));
 		Ok(())
 	}
 

@@ -1,7 +1,7 @@
 //! A jitter buffer that releases several tracks' frames in one decode order, each a fixed
 //! delay after its decode time.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
@@ -100,10 +100,13 @@ pub(crate) struct Buffer<K, T> {
 	tracks: BTreeMap<K, Track<T>>,
 	/// The latest deadline given out.
 	horizon: Option<Instant>,
+	/// The tracks an acquisition waits to hear from, bounded, so that it anchors on whichever
+	/// of them is sent latest against its decode time.
+	expect: BTreeSet<K>,
 	/// Whether a frame has gone out since the clock started.
 	released: bool,
 	/// What the clock is steered on, since it last started.
-	steer: Steer,
+	steer: Steer<K>,
 	timer: Option<Pin<Box<Sleep>>>,
 	dropped: u64,
 	/// Steps at which the source's clock ran further off ours than the clock may follow.
@@ -148,14 +151,22 @@ struct Acquire<K, T> {
 	tracks: BTreeMap<K, bool>,
 }
 
-impl<K, T> Acquire<K, T> {
-	/// The freshest frame: the one read least behind its decode time.
+impl<K: Ord, T> Acquire<K, T> {
+	/// The frame to anchor on: each track's freshest frame (the one read least behind its
+	/// decode time) is that track's slack less its queueing, and of those, the one with the least
+	/// slack, so the track sent latest against its decode time still has the delay.
 	fn fresh(&self) -> &Arrival<T> {
 		let behind = |frame: &Arrival<T>| since(self.since, frame.read) - frame.decode.as_nanos() as i128;
-		self.frames
-			.iter()
-			.map(|(_, frame)| frame)
-			.min_by_key(|frame| behind(frame))
+		let mut freshest: BTreeMap<&K, &Arrival<T>> = BTreeMap::new();
+		for (key, frame) in &self.frames {
+			let best = freshest.entry(key).or_insert(frame);
+			if behind(frame) < behind(best) {
+				*best = frame;
+			}
+		}
+		freshest
+			.into_values()
+			.max_by_key(|frame| behind(frame))
 			.expect("an acquisition holds a frame")
 	}
 
@@ -178,10 +189,9 @@ impl<K, T> Acquire<K, T> {
 }
 
 /// What the clock is steered on.
-#[derive(Default)]
-struct Steer {
+struct Steer<K> {
 	/// This step's floor.
-	floor: Option<Floor>,
+	floor: Option<Floor<K>>,
 	/// Each step's floor, as its decode time and phase in seconds, over the last
 	/// [`RATE_WINDOW`]. Its slope is how much faster the source's clock runs than ours.
 	phase: VecDeque<(f64, f64)>,
@@ -191,12 +201,23 @@ struct Steer {
 	source: Option<f64>,
 }
 
-/// The frame with the most slack in a step: the one queued least on its way.
-struct Floor {
-	/// Its slack past the delay, less how far the drift has moved its deadline, in seconds.
-	phase: f64,
-	/// When it decodes, in seconds.
-	at: f64,
+impl<K> Default for Steer<K> {
+	fn default() -> Self {
+		Self {
+			floor: None,
+			phase: VecDeque::new(),
+			steered: 0.0,
+			source: None,
+		}
+	}
+}
+
+/// Each track's frame with the most slack in a step: the one queued least on its way. The
+/// step's floor is the track with the least of those, the one sent latest against its decode time.
+struct Floor<K> {
+	/// Per track, its slack past the delay, less how far the drift has moved its deadline, and
+	/// when it decodes, in seconds.
+	tracks: BTreeMap<K, (f64, f64)>,
 	/// When the step's first frame decodes.
 	began: Timestamp,
 }
@@ -231,12 +252,18 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 			acquire: None,
 			tracks: BTreeMap::new(),
 			horizon: None,
+			expect: BTreeSet::new(),
 			released: false,
 			steer: Steer::default(),
 			timer: None,
 			dropped: 0,
 			out_of_tolerance: 0,
 		}
+	}
+
+	/// The tracks an acquisition should hear from before it anchors.
+	pub fn expect(&mut self, keys: impl IntoIterator<Item = K>) {
+		self.expect = keys.into_iter().collect();
 	}
 
 	/// Anchor each clock on its first frame instead of acquiring it, for a test that writes a
@@ -263,7 +290,7 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 		};
 		let deadline = self.deadline(&clock, arrival.decode);
 		if self.released && !self.delay.is_zero() {
-			self.steer(deadline, &arrival)?;
+			self.steer(&key, deadline, &arrival)?;
 		}
 		Ok(self.queue(key, arrival, clock.generation, deadline, false))
 	}
@@ -298,7 +325,9 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 		*mid |= !arrival.sync;
 		let now = arrival.read;
 		acquire.frames.push((key, arrival));
-		if grouped || self.replay || self.delay.is_zero() || acquire.end(self.delay) <= now {
+		let acquire = self.acquire.as_ref().expect("just held");
+		let heard = self.heard(acquire);
+		if (grouped && heard) || self.replay || self.delay.is_zero() || self.ends(acquire) <= now {
 			self.acquired();
 		}
 	}
@@ -407,7 +436,7 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 	/// Account for the slack a frame arrived with, and every [`STEER`] of decode time step the
 	/// clock's drift toward the source's rate plus a pull back to the delay, as far as
 	/// [`MAX_SLEW`] allows.
-	fn steer(&mut self, deadline: Option<Instant>, arrival: &Arrival<T>) -> anyhow::Result<()> {
+	fn steer(&mut self, key: &K, deadline: Option<Instant>, arrival: &Arrival<T>) -> anyhow::Result<()> {
 		let (Some(clock), Some(deadline)) = (self.clock, deadline) else {
 			return Ok(());
 		};
@@ -418,13 +447,13 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 		// has moved its deadline.
 		let slack = since(arrival.read, deadline) as f64 / 1e9;
 		let phase = slack - delay - (self.steer.steered + elapsed * clock.drift);
-		let floor = self.steer.floor.get_or_insert(Floor {
-			phase,
-			at: now,
+		let floor = self.steer.floor.get_or_insert_with(|| Floor {
+			tracks: BTreeMap::new(),
 			began: arrival.decode,
 		});
-		if phase > floor.phase {
-			(floor.phase, floor.at) = (phase, now);
+		let best = floor.tracks.entry(key.clone()).or_insert((phase, now));
+		if phase > best.0 {
+			*best = (phase, now);
 		}
 		if arrival.decode.as_nanos().saturating_sub(floor.began.as_nanos()) < STEER.as_nanos() {
 			return Ok(());
@@ -434,9 +463,14 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 			return Ok(());
 		};
 		let floor = self.steer.floor.take().expect("a floor");
+		let (phase, at) = floor
+			.tracks
+			.into_values()
+			.min_by(|a, b| a.0.total_cmp(&b.0))
+			.expect("a floor holds a track");
 		self.steer.steered += elapsed * clock.drift;
 		let phases = &mut self.steer.phase;
-		phases.push_back((floor.at, floor.phase));
+		phases.push_back((at, phase));
 		while phases.front().is_some_and(|&(at, _)| now - at > RATE_WINDOW) {
 			phases.pop_front();
 		}
@@ -510,7 +544,21 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 
 	/// When the acquisition under way ends, unless a track starts a new group first.
 	fn acquired_by(&self) -> Option<Instant> {
-		self.acquire.as_ref().map(|acquire| acquire.end(self.delay))
+		self.acquire.as_ref().map(|acquire| self.ends(acquire))
+	}
+
+	/// Whether every track it expects has delivered a frame to `acquire`.
+	fn heard(&self, acquire: &Acquire<K, T>) -> bool {
+		self.expect.iter().all(|key| acquire.tracks.contains_key(key))
+	}
+
+	/// When `acquire` ends: a track not yet heard from may be the one sent latest, so until
+	/// every expected track has delivered it waits, two delays at most.
+	fn ends(&self, acquire: &Acquire<K, T>) -> Instant {
+		match self.heard(acquire) {
+			true => acquire.end(self.delay),
+			false => acquire.since + 2 * self.delay,
+		}
 	}
 
 	/// The next frame whose deadline has come, in [`Self::front`] order.

@@ -1,14 +1,16 @@
-# [M] TS export carries ATSC AC-3 at every A/52 rate
+# [M] TS export carries 48 kHz ATSC AC-3 at every A/52 rate
 
 ## Goal
 
-`moq export ts` carries AC-3 as ATSC (`stream_type` 0x81, with the 2,592-byte
-main buffer of ATSC A/53 Part 5) at every A/52 rate up to 640 kb/s without
-missing a decode deadline, and the output passes `compliance.py`'s strict
+`moq export ts` carries 48 kHz AC-3 as ATSC (`stream_type` 0x81, with the
+2,592-byte main buffer of ATSC A/53 Part 5) at every A/52 rate up to 640 kb/s
+without missing a decode deadline, and the output passes `compliance.py`'s strict
 `tstd` check. Today every rate from 384 kb/s up aborts the export, and 384 and
 448 kb/s 5.1 is ATSC's standard main audio. The carriage stays ATSC: DVB AC-3
 (5,696 B) already fits every rate, and E-AC-3 has
-[its own quest](/quest/m2/ts-eac3.md).
+[its own quest](/quest/m2/ts-eac3.md). 48 kHz is the only rate ATSC carries;
+a 44.1 or 32 kHz frame can outgrow the buffer on its own (2,786 and 3,840 B at
+640 kb/s), so whether those error or go out as DVB is left open.
 
 ## Plan
 

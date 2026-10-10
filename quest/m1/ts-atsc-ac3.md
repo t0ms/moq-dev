@@ -8,9 +8,11 @@ without missing a decode deadline, and the output passes `compliance.py`'s stric
 `tstd` check. Today every rate from 384 kb/s up aborts the export, and 384 and
 448 kb/s 5.1 is ATSC's standard main audio. The carriage stays ATSC: DVB AC-3
 (5,696 B) already fits every rate, and E-AC-3 has
-[its own quest](/quest/m2/ts-eac3.md). 48 kHz is the only rate ATSC carries;
-a 44.1 or 32 kHz frame can outgrow the buffer on its own (2,786 and 3,840 B at
-640 kb/s), so whether those error or go out as DVB is left open.
+[its own quest](/quest/m2/ts-eac3.md). 48 kHz is the only rate ATSC carries.
+A 44.1 or 32 kHz frame that fits the buffer goes out like any other, and one
+that outgrows it on its own (2,786 and 3,840 B at 640 kb/s) fails the export
+with an error naming both sizes, rather than the misleading "raise the delay or
+the multiplex rate" or a switch to DVB carriage.
 
 ## Plan
 
@@ -34,11 +36,17 @@ partial output is the same coarse timing, not a separate bug.
   coarser) and over shrinking the 25 ms PCR grid, which would cost each PID
   about a tenth of its Rx to the per-slot slack, 2.5 times the clock packets,
   and every PCR-timing expectation.
+- A unit bigger than its PID's decoder buffer can never be admitted, so the
+  export fails it when it is pushed, naming the unit's size and the buffer's,
+  rather than waiting for its deadline to pass. Once every source has ended,
+  the tail still goes out late, as today. Chosen over switching such a track
+  to DVB carriage, which would silently change what an ATSC receiver is handed.
 - [Send-ahead](/quest/m1/tstd/send-ahead.md) bounds a unit's reach by what its
   decoder buffer holds and changes the same code; whichever lands second
   rebases onto the other.
 - Test: schedule unit tests at 384, 448, 512, and 640 kb/s frame sizes against
   the 2,592 B buffer, each frame finishing by its deadline, with the existing
-  decoder-buffer tests moved to the exact decode instant. Raise the
+  decoder-buffer tests moved to the exact decode instant, and a 32 kHz
+  448 kb/s frame (2,688 B) failing with both sizes named. Raise the
   `--headroom` arm's AC-3 (`test/ts/run.sh`) from 192 to 640 kb/s, the worst
   case, so CI grades it under strict `tstd` on every run.

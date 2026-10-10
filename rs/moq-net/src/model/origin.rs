@@ -2500,7 +2500,11 @@ async fn serve_front(task: FrontTask) -> Vec<TrackIo> {
 			.and_then(|resolved| resolved.moved(&table, &path.as_path(), horizon, joined));
 		drop(table);
 		if let Some(prefix) = renew {
-			shared.lock().renew(&prefix);
+			// Checked under the lock that renews: a restart after the read covers the move.
+			let mut table = shared.lock();
+			if !table.restarted_since(&prefix, joined) {
+				table.renew(&prefix);
+			}
 		}
 		Event::Selected { best, serving_closing }
 	};
@@ -3754,14 +3758,15 @@ struct Resolution {
 }
 
 impl Resolution {
-	/// The prefix to [renew](OriginState::renew): on a route without an epoch, a
-	/// request for the path, beneath the prefix, now resolves through another route
-	/// there. The prefix's own winner may be unchanged, so nothing else tells its
-	/// announce cursors that what they resolved under it moved.
+	/// The prefix to [renew](OriginState::renew) unless it already
+	/// [restarted](OriginState::restarted_since) since the last requester `joined`
+	/// the front: on a route without an epoch, a request for the path, beneath the
+	/// prefix, now resolves through another route there. The prefix's own winner may
+	/// be unchanged, so nothing else tells its announce cursors that what they
+	/// resolved under it moved.
 	///
-	/// A cursor that restarted since the last requester `joined` the front already
-	/// told everyone on it, and a renewal would restart it again. Settled once per
-	/// join: a renewal leaves the front's instance behind, so nobody joins it after.
+	/// Settled once per join: a renewal leaves the front's instance behind, so
+	/// nobody joins it after.
 	fn moved(&mut self, table: &OriginState, path: &Path, horizon: Horizon, joined: u64) -> Option<PathOwned> {
 		if self.settled == Some(joined) || !matches!(self.instance, Instance::Route(_)) {
 			return None;
@@ -3776,10 +3781,7 @@ impl Resolution {
 			return None;
 		}
 		self.settled = Some(joined);
-		match table.restarted_since(prefix, joined) {
-			true => None,
-			false => Some(prefix.clone()),
-		}
+		Some(prefix.clone())
 	}
 }
 

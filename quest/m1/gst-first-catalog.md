@@ -16,8 +16,9 @@ resolve and has the same gap, which is planned separately.
 
 ## Plan
 
-Decided 2026-10-10, planning the follow-ups of
-[#5181](https://github.com/moq-dev/moq/pull/5181):
+Decided 2026-10-10, planning the follow-ups of moqsrc's restart work
+([#5181](https://github.com/moq-dev/moq/pull/5181), superseded by
+[#5191](https://github.com/moq-dev/moq/pull/5191)):
 
 - The fix lives in `moqsink`, and `moqsrc`'s rule stays: a rendition the new
   run's first catalog does not list ends with EOS. Holding unlisted
@@ -53,10 +54,6 @@ Open, for the maintainer:
 Tests: a `moqsink` whose audio pad gets caps after its video pad's first
 buffer publishes one first catalog listing both; and a `moqsrc` following
 that `moqsink` across a restart keeps both pads without EOS.
-
-## Required
-
-- [moqsrc follows a restart](/quest/m0/broadcast-epoch/moqsrc.md) - the restart hold this protects, and the end-to-end test
 
 ## Related
 

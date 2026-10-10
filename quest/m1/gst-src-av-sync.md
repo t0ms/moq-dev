@@ -6,8 +6,8 @@ All of a `moqsrc` run's pads share one timestamp reference and one segment
 base, so audio and video keep the relative timing the broadcast gives them,
 at the first start and after every switch. Today each pump starts its PTS at
 its own first frame (`reference_ts` in `rs/moq-gst/src/source/imp.rs`) and
-bases its segment on the running time its own first buffer arrived
-(`live_segment`), so two tracks line up only as well as their first frames'
+bases the segment it pushes with its first buffer on the running time that
+buffer arrived, so two tracks line up only as well as their first frames'
 arrivals happen to match their timestamps. A video track joining at a
 keyframe and an audio track joining at its latest group start apart.
 
@@ -17,8 +17,9 @@ settles on the sink side; jitter buffering.
 
 ## Plan
 
-Decided 2026-10-10, planning the follow-ups of
-[#5181](https://github.com/moq-dev/moq/pull/5181): the tracks of one
+Decided 2026-10-10, planning the follow-ups of moqsrc's restart work
+([#5181](https://github.com/moq-dev/moq/pull/5181), superseded by
+[#5191](https://github.com/moq-dev/moq/pull/5191)): the tracks of one
 broadcast share one timeline, which the catalog's one `clock` maps to wall
 time, so equal times on different tracks present together. They do not
 share one scale: CMAF keeps each track's `mdhd` timescale, and LOC can carry
@@ -51,10 +52,6 @@ Test: a broadcast whose audio and video first frames differ by a known
 offset reaches `moqsrc`'s two pads with that offset between their running
 times, at the first start and after a restart, whichever pump reads first.
 One case is a CMAF broadcast whose tracks use different timescales.
-
-## Required
-
-- [moqsrc follows a restart](/quest/m0/broadcast-epoch/moqsrc.md) - rewrites the pumps and segments this changes
 
 ## Related
 

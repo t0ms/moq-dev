@@ -173,6 +173,7 @@ bench all require its crate.
 - [T-STD TS export](/quest/m1/tstd/README.md) - `moq export ts` is a proper remux that passes the T-STD buffer model, starting with a fixed `--delay`
 - [Multi-packet PMT](/quest/m1/ts-pmt-split.md) - `export ts` splits a PMT longer than one packet instead of exiting before its first packet
 - [ATSC AC-3](/quest/m1/ts-atsc-ac3.md) - `export ts` carries 48 kHz ATSC AC-3 at every A/52 rate up to 640 kb/s instead of aborting from 384 kb/s up
+- [TS table bursts](/quest/m1/ts-psi-repeat.md) - `export ts` lays a repeated PAT and PMT once where aligned keyframes would bunch them past their transport buffer
 - [TS damage log](/quest/m1/ts-damage-log.md) - a burst of damaged TS units logs a first warning and a periodic summary per PID, not one warning per unit
 - [TS adaptation field length](/quest/m1/ts-adaptation-only.md) - a TS adaptation field with the wrong length for its packet (183 adaptation-only, at most 182 with a payload) is refused as damage
 - [Rust non-continuous signal](/quest/m1/rust-continuous.md) - the Rust container consumer reports a frame after a subscribe or discontinuity as non-continuous, like JS, for the tune-in and warmup trims

@@ -994,8 +994,8 @@ struct RemoteFront {
 }
 
 /// The last route a cursor observed: the instance it serves, its metadata,
-/// servability, and captures.
-type CursorRoute = (Instance, RouteMeta, bool, Option<Vec<Pattern>>);
+/// servability, captures, and [`OriginState::next_route`] as it started.
+type CursorRoute = (Instance, RouteMeta, bool, Option<Vec<Pattern>>, u64);
 
 impl WeakEntry for RemoteFront {
 	fn is_closed(&self) -> bool {
@@ -1086,22 +1086,29 @@ impl TableCursor {
 			&& self.named.as_ref().is_none_or(|(mount, _)| mount.names(&entry.prefix))
 	}
 
-	/// Deliver a changed winner at this presented prefix.
-	fn update(&mut self, presented: &PathOwned, best: Option<&RouteEntry>) {
+	/// Deliver a changed winner at this presented prefix, as of `now`, the
+	/// [`OriginState::next_route`].
+	fn update(&mut self, presented: &PathOwned, best: Option<&RouteEntry>, now: u64) {
 		match best {
 			Some(entry) => {
 				let meta = (entry.hops.clone(), entry.cost, entry.entered(), entry.epoch.clone());
 				let served = entry.server.is_some();
 				let captures = self.captures(&entry.prefix);
 				let instance = entry.instance();
+				let started = match self.current.get(presented) {
+					Some((prev, _, _, prev_captures, started)) if *prev == instance && *prev_captures == captures => {
+						*started
+					}
+					_ => now,
+				};
 				let previous = self.current.insert(
 					presented.clone(),
-					(instance.clone(), meta.clone(), served, captures.clone()),
+					(instance.clone(), meta.clone(), served, captures.clone(), started),
 				);
 				match previous {
 					// Captures are consumer identity, not route metadata. Replace the old
 					// identity explicitly so consumers keyed on it remove it.
-					Some((_, prev, _, prev_captures)) if prev_captures != captures => {
+					Some((_, prev, _, prev_captures, _)) if prev_captures != captures => {
 						if let Ok(mut state) = self.state.write() {
 							state.apply_unannounce(self.under.join(presented), prev, prev_captures);
 							state.apply_announce(self.under.join(presented), meta, captures);
@@ -1119,7 +1126,7 @@ impl TableCursor {
 					// A servability flip is delivered: a request that failed Unroutable
 					// under an advertise-only route retries on the update, and hiding
 					// it would park that waiter forever.
-					Some((_, prev, prev_served, _)) if prev == meta && prev_served == served => {}
+					Some((_, prev, prev_served, ..)) if prev == meta && prev_served == served => {}
 					_ => {
 						if let Ok(mut state) = self.state.write() {
 							state.apply_announce(self.under.join(presented), meta, captures);
@@ -1128,7 +1135,7 @@ impl TableCursor {
 				}
 			}
 			None => {
-				if let Some((_, last, _, captures)) = self.current.remove(presented)
+				if let Some((_, last, _, captures, _)) = self.current.remove(presented)
 					&& let Ok(mut state) = self.state.write()
 				{
 					state.apply_unannounce(self.under.join(presented), last, captures);
@@ -3409,6 +3416,8 @@ struct OriginState {
 	// The announced routes, keyed by prefix. The table holds one entry per live
 	// advertisement, not one per broadcast consumer.
 	routes: RouteTable,
+	// Route ids and generations, and the clock a cursor's start and a front's join
+	// read. A join takes a value of its own, so a start before it reads older.
 	next_route: u64,
 	next_watch: u64,
 
@@ -3519,6 +3528,7 @@ impl OriginState {
 	fn sync_route(&mut self, prefix: &Path, claim: &Pattern) {
 		// Split borrows: the recompute reads `routes` while mutating a cursor.
 		let routes = &self.routes;
+		let now = self.next_route;
 		let mut candidates = None;
 		for id in routes.cursors_touching(prefix) {
 			let Some(cursor) = self.cursors.get_mut(&id) else {
@@ -3527,7 +3537,7 @@ impl OriginState {
 			if let Some(presented) = cursor.presented(prefix, claim) {
 				if presented.is_empty() {
 					// A cursor root can collapse several covering prefixes into one.
-					Self::sync_cursor(routes, cursor, &presented);
+					Self::sync_cursor(routes, cursor, &presented, now);
 				} else {
 					// Every non-root presentation refers to this exact prefix. Rank
 					// its routes once, then take each cursor's first visible entry.
@@ -3543,7 +3553,7 @@ impl OriginState {
 						.iter()
 						.map(|(_, entry)| *entry)
 						.find(|entry| cursor.visible(entry));
-					cursor.update(&presented, best);
+					cursor.update(&presented, best, now);
 				}
 			}
 		}
@@ -3583,8 +3593,8 @@ impl OriginState {
 	}
 
 	/// Recompute the best visible route presenting at `presented` (relative) for
-	/// one cursor and deliver the change, if any.
-	fn sync_cursor(routes: &RouteTable, cursor: &mut TableCursor, presented: &PathOwned) {
+	/// one cursor and deliver the change, if any, as of `now`.
+	fn sync_cursor(routes: &RouteTable, cursor: &mut TableCursor, presented: &PathOwned, now: u64) {
 		// The entries presenting here are the ones announced at the absolute
 		// prefix, or, for the cursor's own root, at the root and every prefix
 		// above it (all of which present as the empty path). Among them, the
@@ -3608,7 +3618,7 @@ impl OriginState {
 				.min_by_key(|entry| route_order(&entry.prefix, entry))
 		});
 
-		cursor.update(presented, best);
+		cursor.update(presented, best, now);
 	}
 
 	/// Register a cursor and replay the current best route per presented prefix.
@@ -3629,7 +3639,7 @@ impl OriginState {
 			}
 		}
 		for p in &presented {
-			Self::sync_cursor(&self.routes, &mut cursor, p);
+			Self::sync_cursor(&self.routes, &mut cursor, p, self.next_route);
 		}
 		for head in &cursor.heads {
 			self.routes.add_cursor(head, id);
@@ -3683,17 +3693,17 @@ impl OriginState {
 		best
 	}
 
-	/// Whether every cursor presenting `prefix` restarted it since route generation
-	/// `since`: none still presents an instance without an epoch from before, which
-	/// is what a [renewal](Self::renew) would restart.
+	/// Whether every cursor presenting `prefix` restarted it since
+	/// [`next_route`](Self::next_route) read `since`: none still presents an instance
+	/// without an epoch it started before, which is what a [renewal](Self::renew)
+	/// would restart.
 	fn restarted_since(&self, prefix: &Path, since: u64) -> bool {
-		let old = |instance: &Instance| matches!(instance, Instance::Route(generation) if *generation < since);
 		// Without a route there from before, no cursor can present one: the common
 		// case once a renewal moved every generation, and cheaper than the cursors.
 		let Some(claim) = self
 			.routes
 			.at(prefix)
-			.find(|entry| old(&entry.instance()))
+			.find(|entry| matches!(entry.instance(), Instance::Route(generation) if generation < since))
 			.map(|entry| &entry.claim)
 		else {
 			return true;
@@ -3705,7 +3715,8 @@ impl OriginState {
 			let current = cursor
 				.presented(prefix, claim)
 				.and_then(|presented| cursor.current.get(&presented));
-			!current.is_some_and(|(instance, ..)| old(instance))
+			// An older route the cursor switched to since is a restart all the same.
+			!current.is_some_and(|(instance, .., started)| matches!(instance, Instance::Route(_)) && *started < since)
 		})
 	}
 }
@@ -4700,6 +4711,7 @@ impl Consumer {
 				.then(|| front.broadcast.consume())
 				.filter(|held| !held.is_closed());
 			if let Some(held) = held {
+				state.next_route += 1;
 				front.joined.store(state.next_route, Ordering::Release);
 				let pending = Requesting::queued(front.request.consume(), held)
 					.with_path(requested)
@@ -4725,6 +4737,7 @@ impl Consumer {
 		// The front starts held by this request; see [`Front::new`].
 		let held = broadcast.consume();
 		let watch = state.watch(&self.shared, &absolute);
+		state.next_route += 1;
 		let joined = Arc::new(AtomicU64::new(state.next_route));
 		state.fronts.insert(
 			key,
@@ -5964,6 +5977,23 @@ mod tests {
 
 		c.update(Route::default().with_hops(hops(&[12])).with_cost(3)).unwrap();
 		assert_eq!(announced.assert_next_restarted("room").cost, Cost::new(2));
+		quiet(&mut announced).await;
+	}
+
+	/// A route from before the request repricing to win both the prefix and the held
+	/// path restarts the prefix once: the cursor's own switch covers the move.
+	#[moq_net_sim::test]
+	async fn a_repriced_route_taking_a_held_path_restarts_once() {
+		let (producer, claim) = scoped_pool();
+		let consumer = producer.consume();
+		let a = claim("room", "room", 10, 5);
+		let b = claim("room", "room", 11, 9);
+		let mut announced = consumer.announced();
+		assert_eq!(announced.assert_next_active("room").cost, Cost::new(5));
+		let _sticky = hold(&consumer, "room/job", &a).await;
+
+		b.update(Route::default().with_hops(hops(&[11])).with_cost(3)).unwrap();
+		assert_eq!(announced.assert_next_restarted("room").cost, Cost::new(3));
 		quiet(&mut announced).await;
 	}
 

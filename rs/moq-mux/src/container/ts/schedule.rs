@@ -155,22 +155,16 @@ impl Slot {
 	/// frame's few packets muxed whole, or a video PID taking most of the slot. The program
 	/// tables (PAT and the PMT on `pmt_pid`) go just ahead of the first packet muxed after
 	/// them, so they still lead the keyframe they were written for and a reader knows each PID
-	/// before its first packet. A table repeated within the slot, as when several PIDs'
-	/// keyframes each carry the tables, tells a reader nothing new and would only add to that
-	/// run, so a null takes its place.
+	/// before its first packet.
 	pub fn layout(&self, clock: &[u8], pmt_pid: u16, null: &[u8]) -> Vec<u8> {
 		let packets = self.packets.as_chunks::<{ TsPacket::SIZE }>().0;
-		let mut tables: Vec<usize> = Vec::new();
-		let mut nulls = self.nulls;
+		let mut tables = Vec::new();
 		// Each PID's packets in mux order: the clock's PID first, then the rest as they appear.
 		let mut lanes: Vec<(u16, VecDeque<usize>)> = vec![(pid(clock), VecDeque::new())];
 		for (i, packet) in packets.iter().enumerate() {
 			let pid = pid(packet);
 			if pid == 0 || pid == pmt_pid {
-				match tables.iter().any(|&table| packets[table] == *packet) {
-					true => nulls += 1,
-					false => tables.push(i),
-				}
+				tables.push(i);
 			} else if let Some((_, lane)) = lanes.iter_mut().find(|(p, _)| *p == pid) {
 				lane.push_back(i);
 			} else {
@@ -184,7 +178,7 @@ impl Slot {
 		let mut weights: Vec<i64> = lanes
 			.iter()
 			.map(|(_, lane)| lane.len() as i64)
-			.chain([nulls as i64])
+			.chain([self.nulls as i64])
 			.collect();
 		weights[0] += 1;
 		let total: i64 = weights.iter().sum();
@@ -927,36 +921,5 @@ mod tests {
 		(null[1], null[2]) = (0x1f, 0xff);
 		let laid: Vec<u16> = slot.layout(&unit(1, 1), 100, &null).chunks(188).map(pid).collect();
 		assert_eq!(laid, [1, 0, 100, 3, 0x1fff, 3, 3, 1, 0x1fff, 3]);
-	}
-
-	/// Tables repeated ahead of several PIDs' keyframes in one slot would all go ahead of the
-	/// first of them in a run, overflowing the system transport buffer, so the slot carries each
-	/// once and nulls take the repeats' places.
-	#[test]
-	fn a_slot_carries_each_table_once() {
-		// The PAT and PMT ahead of a keyframe on each of PIDs 1, 2 and 3, the last the heaviest.
-		let mut packets = Vec::new();
-		for (pid, count) in [(1, 2), (2, 2), (3, 10)] {
-			packets.extend(unit(0, 1));
-			packets.extend(unit(100, 1));
-			packets.extend(unit(pid, count));
-		}
-		let slot = Slot {
-			index: 0,
-			pcr: 0,
-			packets,
-			nulls: 4,
-			keyframe: true,
-			units: vec![1, 2, 3],
-		};
-		let mut null = unit(0, 1);
-		(null[1], null[2]) = (0x1f, 0xff);
-		let laid: Vec<u16> = slot.layout(&unit(1, 1), 100, &null).chunks(188).map(pid).collect();
-		assert_eq!(laid.len(), 1 + 20 + 4, "the slot keeps its length");
-		assert_eq!(laid.iter().filter(|&&pid| pid == 0).count(), 1, "one PAT: {laid:?}");
-		assert_eq!(laid.iter().filter(|&&pid| pid == 100).count(), 1, "one PMT: {laid:?}");
-		// After the clock packet, no media goes ahead of the tables.
-		let pmt = laid.iter().position(|&pid| pid == 100).unwrap();
-		assert!(laid[1..pmt].iter().all(|&pid| pid == 0 || pid == 0x1fff), "the tables lead: {laid:?}");
 	}
 }

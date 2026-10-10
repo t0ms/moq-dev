@@ -179,7 +179,7 @@ if [[ -n "$HEADROOM" && -n "$HRD$OPEN_GOP$SOURCE$ANALYZE_ONLY" ]]; then
     exit 1
 fi
 # Room for the audio, with the video still taking up to 86 % of the multiplex.
-[[ -n "$HEADROOM" && -z "$BITRATE_SET" ]] && BITRATE=12500000
+[[ -n "$HEADROOM" && -z "$BITRATE_SET" && -z "${TSC_BITRATE:-}" ]] && BITRATE=12500000
 if [[ -n "$OPEN_GOP" && -n "$ANALYZE_ONLY$LIVE$PAIR" ]]; then
     echo "error: --open-gop cannot be combined with --analyze-only, --live, or --pair" >&2
     exit 1

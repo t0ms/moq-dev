@@ -78,9 +78,9 @@ impl Buffer {
 		size: None,
 	};
 
-	/// The packets one slot may carry on the PID, a clock packet on it included: what its
-	/// transport buffer passes on within the slot, less one. Even laid out evenly, the packets
-	/// bunch a little where one slot meets the next, and the slack drains that off.
+	/// The packets one slot may carry on the PID: what its transport buffer passes on within
+	/// the slot, less one, but at least one. Even laid out evenly, the packets bunch a little
+	/// where one slot meets the next, and the slack drains that off.
 	fn per_slot(&self) -> usize {
 		let bits = u128::from(self.rate) * PCR_INTERVAL.as_nanos() / 1_000_000_000;
 		(bits / (TsPacket::SIZE as u128 * 8)).saturating_sub(1).max(1) as usize
@@ -288,7 +288,8 @@ impl Schedule {
 		self.buffers.insert(pid, buffer);
 	}
 
-	/// Count every slot's clock packet, which rides on `pid`, against that PID's buffers.
+	/// Count every slot's clock packet, which rides on `pid`, against that PID's transport
+	/// buffer, as long as the PID keeps a packet a slot for its media.
 	pub fn set_clock(&mut self, pid: u16) {
 		self.clock = Some(pid);
 	}
@@ -467,7 +468,14 @@ impl Schedule {
 		let mut order: Vec<usize> = (0..self.units.len()).collect();
 		order.sort_by_key(|&i| self.units[i].due);
 		let mut take = vec![0; self.units.len()];
-		let mut carried: HashMap<u16, usize> = self.clock.map(|pid| (pid, 1)).into_iter().collect();
+		// The clock packet counts against its PID unless that would leave the PID's media no
+		// packet at all, which would never finish a unit however sparse its frames.
+		let mut carried: HashMap<u16, usize> = self
+			.clock
+			.filter(|pid| self.buffers.get(pid).is_some_and(|buffer| buffer.per_slot() > 1))
+			.map(|pid| (pid, 1))
+			.into_iter()
+			.collect();
 		let mut stopped: Vec<u16> = Vec::new();
 		for i in order {
 			let unit = &self.units[i];
@@ -711,6 +719,33 @@ mod tests {
 			.map(|(_, per_pid, _)| per_pid.get(&1).copied().unwrap_or(0))
 			.max();
 		assert_eq!(most, Some(31));
+	}
+
+	/// A PID whose transport buffer passes on a single packet a slot still carries one of its
+	/// own beside the clock packet, so its units finish on time and the stream ends.
+	#[test]
+	fn a_one_packet_pid_still_progresses_beside_the_clock() {
+		let mut schedule = Schedule::new(Duration::from_millis(100));
+		schedule.set_rate(Some(RATE));
+		// 76.8 kb/s: one packet a slot.
+		let slow = Buffer {
+			rate: 76_800,
+			size: Some(100_000),
+		};
+		schedule.set_buffer(1, slow);
+		schedule.set_clock(1);
+		schedule.push(1, ms(1_000), unit(1, 4), true);
+		schedule.push(1, ms(1_200), unit(1, 4), false);
+		let mut sent = Vec::new();
+		for _ in 0..100 {
+			let Some(slot) = schedule.next(None).unwrap() else {
+				break;
+			};
+			sent.push(slot.packets.len() / TsPacket::SIZE);
+		}
+		assert!(sent.iter().all(|&n| n <= 1), "one packet a slot: {sent:?}");
+		assert_eq!(sent.iter().sum::<usize>(), 8, "both units go out");
+		assert!(schedule.is_empty(), "and the stream ends");
 	}
 
 	/// A PID never holds more in its decoder buffer than it has: the next unit waits for the

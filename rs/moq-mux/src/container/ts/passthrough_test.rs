@@ -12,7 +12,8 @@ use bytes::Bytes;
 use super::fixture::{ACCESS, Flags, MS, Mux, WRAP, paced, program};
 use super::import::test::{WRAP_MICROS, epoch_clock, epoch_time};
 use super::passthrough::{
-	GROUP_BYTES_MAX, GROUP_OBJECTS_MAX, PacketSizeError, Passthrough, PcrGapError, PcrRestartError, PcrRewindError,
+	GROUP_BYTES_MAX, GROUP_OBJECTS_MAX, GroupFullError, PacketSizeError, Passthrough, PcrGapError, PcrRestartError,
+	PcrRewindError,
 };
 
 /// A delay budget no test timeline comes close to, so the reader sees every group.
@@ -32,6 +33,8 @@ struct Object {
 struct Imported {
 	catalog: hang::catalog::Catalog,
 	objects: Vec<Object>,
+	/// Every group's sequence, empty ones included, in the order received.
+	sequences: Vec<u64>,
 }
 
 impl Imported {
@@ -112,7 +115,9 @@ async fn read_back(
 		.subscribe(moq_net::track::Subscription::default().with_max_delay(RECORDING_MAX_DELAY))
 		.await?;
 	let mut objects = Vec::new();
+	let mut sequences = Vec::new();
 	while let Some(mut group) = tokio::time::timeout(Duration::from_secs(1), track.recv_group()).await?? {
+		sequences.push(group.sequence);
 		while let Some(frame) = group.read_frame().await? {
 			let frame = hang::container::Frame::decode(frame.payload)?;
 			objects.push(Object {
@@ -125,6 +130,7 @@ async fn read_back(
 	Ok(Imported {
 		catalog: catalog.snapshot(),
 		objects,
+		sequences,
 	})
 }
 
@@ -636,12 +642,21 @@ struct Placed {
 
 impl Placed {
 	fn new(epoch: std::time::SystemTime) -> Self {
+		Self::on(epoch, true)
+	}
+
+	/// An importer on a timebase `epoch` places, which also aligns its groups when `aligned`, as the
+	/// CLI's shared epoch does.
+	fn on(epoch: std::time::SystemTime, aligned: bool) -> Self {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 		let timebase = catalog.timebase();
 		timebase
 			.place(moq_net::Timestamp::ZERO, epoch - Duration::from_micros(WRAP_MICROS))
 			.unwrap();
+		if aligned {
+			timebase.align_groups();
+		}
 		let passthrough = Passthrough::new(broadcast.clone(), timebase.reserve()).unwrap();
 		Self {
 			broadcast: broadcast.consume(),
@@ -665,19 +680,25 @@ fn starts(imported: &Imported) -> Vec<bool> {
 		.collect()
 }
 
+/// [`import_twice`] with aligned groups.
+async fn import_twice_placed(data: &[u8], prefix: usize, join: u64) -> (Imported, Imported) {
+	import_twice(data, prefix, join, true).await
+}
+
 /// Import `data` placed by one epoch from its first byte, and again, on a host clock 7 ms ahead,
 /// from the program and then the packet carrying PCR `join`, the two fed in step. From the second's
-/// first group on, both must publish the same objects in the same groups, and from the second's
-/// first section on, the same section after every PCR.
-async fn import_twice_placed(data: &[u8], prefix: usize, join: u64) -> (Imported, Imported) {
+/// first group on, both must publish the same objects in the same groups, and when `aligned` under
+/// the same sequences, empty groups included; from the second's first section on, the same section
+/// after every PCR.
+async fn import_twice(data: &[u8], prefix: usize, join: u64, aligned: bool) -> (Imported, Imported) {
 	let epoch = epoch_time();
 	let hosts = [epoch + Duration::from_secs(600), epoch + Duration::from_millis(600_007)];
 	let split = pcr_at(data, join);
 	crate::clock::fake_host_wall(hosts[0]);
-	let mut first = Placed::new(epoch);
+	let mut first = Placed::on(epoch, aligned);
 	first.passthrough.decode(&data[..split]).unwrap();
 	crate::clock::fake_host_wall(hosts[1]);
-	let mut second = Placed::new(epoch);
+	let mut second = Placed::on(epoch, aligned);
 	second.passthrough.decode(&data[..prefix]).unwrap();
 	let mut described = false;
 	for pkt in data[split..].chunks(188) {
@@ -707,7 +728,22 @@ async fn import_twice_placed(data: &[u8], prefix: usize, join: u64) -> (Imported
 		);
 	}
 	assert_eq!(starts(&first)[skip..], starts(&second), "group starts");
+	if aligned {
+		let groups = |imported: &Imported| imported.objects.iter().map(|object| object.group).collect::<Vec<_>>();
+		assert_eq!(groups(&first)[skip..], groups(&second), "each object's group sequence");
+		assert!(
+			first.sequences.ends_with(&second.sequences),
+			"the joiner's groups: {:?} vs {:?}",
+			second.sequences,
+			first.sequences
+		);
+	}
 	(first, second)
+}
+
+/// Whether `imported` skipped no sequence, as a timeline with no break never does on the grid.
+fn consecutive(imported: &Imported) -> bool {
+	imported.sequences.windows(2).all(|pair| pair[1] == pair[0] + 1)
 }
 
 /// Importers placed by one epoch publish identical objects across a PCR wrap, the second joining
@@ -782,7 +818,8 @@ async fn importers_sharing_an_epoch_cut_the_same_groups() {
 		}
 		let data = mux.bytes();
 		for join in [2_520, 4_720, 7_360] {
-			let (first, _) = import_twice_placed(&data, prefix, join * MS).await;
+			let (first, second) = import_twice_placed(&data, prefix, join * MS).await;
+			assert!(consecutive(&first) && consecutive(&second), "gop {gop}, join {join}");
 			let fallback = first
 				.groups()
 				.iter()
@@ -796,8 +833,8 @@ async fn importers_sharing_an_epoch_cut_the_same_groups() {
 	}
 }
 
-/// Importers placed by one epoch split groups at the object ceiling alike, the ceiling counted
-/// from a group start both made.
+/// Importers placed by one epoch without aligned groups split groups at the object ceiling alike,
+/// the ceiling counted from a group start both made.
 #[tokio::test(start_paused = true)]
 async fn importers_sharing_an_epoch_split_full_groups_alike() {
 	let mut mux = Mux::default();
@@ -809,7 +846,7 @@ async fn importers_sharing_an_epoch_split_full_groups_alike() {
 		mux.packet(0x100, Flags::pcr(i * 5_400));
 	}
 	let data = mux.bytes();
-	let (first, second) = import_twice_placed(&data, prefix, 3_300 * MS).await;
+	let (first, second) = import_twice(&data, prefix, 3_300 * MS, false).await;
 	let full = second
 		.groups()
 		.iter()
@@ -819,9 +856,31 @@ async fn importers_sharing_an_epoch_split_full_groups_alike() {
 	assert!(!first.section().random_access);
 }
 
-/// The grid lies on the timeline the epoch places, so it runs on regularly across a PCR wrap that
-/// would shift a grid of raw ticks by about 0.72 s, and an importer joining after the wrap cuts on
-/// it too.
+/// With aligned groups, a group is its second of the grid and cannot split, so one that reaches the
+/// object ceiling ends the import.
+#[tokio::test(start_paused = true)]
+async fn an_aligned_group_at_the_ceiling_ends_the_import() {
+	let mut mux = Mux::default();
+	program(&mut mux, 0x100);
+	mux.packet(0x100, Flags::pcr(0).random_access());
+	// A PCR in every packet, 200 µs apart: 5,000 objects a second.
+	for i in 1..15_000 {
+		mux.packet(0x100, Flags::pcr(i * 5_400));
+	}
+	let data = mux.bytes();
+	crate::clock::fake_host_wall(epoch_time() + Duration::from_secs(600));
+	let mut placed = Placed::new(epoch_time());
+	let err = data
+		.chunks(188)
+		.try_for_each(|pkt| placed.passthrough.decode(pkt))
+		.expect_err("a group past the ceiling");
+	let full = err.downcast_ref::<GroupFullError>().expect("a full group");
+	assert_eq!(full.objects, GROUP_OBJECTS_MAX + 1);
+}
+
+/// The grid lies on the catalog clock the epoch places, so it runs on regularly across a PCR wrap
+/// that would shift a grid of raw ticks by about 0.72 s, and an importer joining after the wrap
+/// cuts on it too, each second's group numbered by that second.
 #[tokio::test(start_paused = true)]
 async fn the_grid_runs_on_across_a_wrap() {
 	const WRAP: u64 = (1 << 33) * 300;
@@ -834,15 +893,24 @@ async fn the_grid_runs_on_across_a_wrap() {
 		mux.fill(0x101, 4);
 	}
 	let data = mux.bytes();
-	let (first, _) = import_twice_placed(&data, prefix, 2_000 * MS).await;
+	let (first, second) = import_twice_placed(&data, prefix, 2_000 * MS).await;
 	let groups = first.groups();
 	assert!(groups.len() >= 10, "{} groups", groups.len());
 	for group in &groups {
-		let pcr = header(&group[0].payload).pcr.expect("a cut on the grid falls on a PCR");
-		let unwrapped = if pcr >= start { pcr } else { pcr + WRAP };
-		let past = unwrapped % (1_000 * MS);
-		assert!(past < 40 * MS, "a cut {} ms past the line", past / MS);
+		assert!(
+			header(&group[0].payload).pcr.is_some(),
+			"a cut on the grid falls on a PCR"
+		);
+		// An object starts ten bytes ahead of its PCR, so the one at the line can sit just short of it.
+		let micros = group[0].micros + 1_000;
+		assert!(
+			micros % 1_000_000 < 41_000,
+			"a cut {} µs past the line",
+			micros % 1_000_000
+		);
+		assert_eq!(group[0].group, micros / 1_000_000, "numbered by its second");
 	}
+	assert!(consecutive(&first) && consecutive(&second));
 }
 
 /// With every PCR in the era nearest the clock and nothing clamping it, a flagged jump forward by
